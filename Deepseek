@@ -6,7 +6,7 @@ import requests
 from tqdm import tqdm
 
 # 配置DeepSeek API参数
-DEEPSEEK_API_KEY = "sk-3840bf569c4b48d0a3b60e25ded2ee94"
+DEEPSEEK_API_KEY = "sk-×××××××××××××××××××××××××××××××"
 API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 VALID_LANGUAGES = ["德文", "法文", "英文", "日文", "丹麦文","意大利文"]
