@@ -1,0 +1,206 @@
+import os
+import re
+import time
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from typing import List, Dict, Tuple
+from docx import Document
+from docx.oxml.ns import qn
+from docx.shared import Pt, RGBColor
+from tencentcloud.common import credential, exception
+from tencentcloud.common.profile.client_profile import ClientProfile
+from tencentcloud.common.profile.http_profile import HttpProfile
+from tencentcloud.hunyuan.v20230901 import hunyuan_client, models
+
+class TencentTranslationAPI:
+    """腾讯混元翻译接口封装类"""
+    
+    def __init__(self):
+        self.client = self._init_client()
+        self.lock = threading.Lock()  # 用于API调用速率控制
+        self.last_call_time = 0  # 记录最后一次API调用时间
+        
+    def _init_client(self):
+        """初始化腾讯云客户端"""
+        secret_id = os.getenv("TENCENT_SECRET_ID")
+        secret_key = os.getenv("TENCENT_SECRET_KEY")
+        
+        if not secret_id or not secret_key:
+            raise ValueError("缺少腾讯云凭证，请设置环境变量TENCENT_SECRET_ID和TENCENT_SECRET_KEY")
+
+        cred = credential.Credential(secret_id, secret_key)
+        http_profile = HttpProfile()
+        http_profile.endpoint = "hunyuan.tencentcloudapi.com"
+        http_profile.reqTimeout = 30
+
+        client_profile = ClientProfile()
+        client_profile.httpProfile = http_profile
+
+        return hunyuan_client.HunyuanClient(cred, "ap-guangzhou", client_profile)
+    
+    def translate_text(self, text: str, source_lang: str, target_lang: str, project_id: str = "") -> dict:
+        """
+        腾讯混元翻译接口
+        :param text: 待翻译文本
+        :param source_lang: 源语言代码（如en）
+        :param target_lang: 目标语言代码（如zh）
+        :param project_id: 项目ID（可选）
+        :return: 翻译结果
+        """
+        try:
+            # 构造请求体（新增Model参数）
+            request = models.ChatTranslationsRequest()
+            params = {
+                "Text": text,
+                "Source": source_lang,
+                "Target": target_lang,
+                "ProjectId": project_id,
+                "Model": "hunyuan-translation"  # 显式指定模型
+            }
+            request.from_json_string(json.dumps(params))
+            
+            # API调用速率控制
+            with self.lock:
+                current_time = time.time()
+                elapsed = current_time - self.last_call_time
+                if elapsed < 0.5:  # 确保每次调用至少间隔0.5秒
+                    time.sleep(0.5 - elapsed)
+                
+                # 发起请求
+                resp = self.client.ChatTranslations(request)
+            
+            # 解析响应
+            result = {
+                "translated_text": resp.Choices[0].Message.Content.strip(),
+                "source_language": source_lang,
+                "target_language": target_lang,
+                "usage": {
+                    "total_tokens": resp.Usage.TotalTokens,
+                    "prompt_tokens": resp.Usage.PromptTokens,
+                    "completion_tokens": resp.Usage.CompletionTokens
+                },
+                "request_id": resp.RequestId,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            return result
+        
+        except exception.TencentCloudSDKException as e:
+            return {"error": f"API调用失败: {str(e)}"}
+        except Exception as e:
+            return {"error": f"未知错误: {str(e)}"}
+
+class DocumentProcessor:
+    """文档处理核心类"""
+    
+    LANG_MAP = {
+        "de": "en", "fr": "en", "en": "en",
+        "ja": "en", "da": "en", "zh": "zh",
+        "it": "en", "nor":"en","fi":"en"
+    }
+    
+    def __init__(self, folder_path):
+        self.translator = TencentTranslationAPI()
+        self.folder_path = folder_path
+        self.total_time = 0
+        
+    def process_folder(self, source_lang: str):
+        """处理整个文件夹"""
+        start_time = time.time()
+        valid_files = self._find_docx_files()
+        
+        if not valid_files:
+            print("未找到有效的Word文档")
+            return
+        
+        print(f"开始处理 {len(valid_files)} 个文件...")
+        
+        file_count = 0
+        for file_path in valid_files:
+            file_count += 1
+            print(f"\nProcessing file {file_count}/{len(valid_files)}: {file_path}")
+            
+            doc = self._open_docx(file_path)
+            paragraphs = self._extract_paragraphs(doc)
+            
+            if not paragraphs:
+                print("文档无有效内容")
+                continue
+            
+            output_doc = self._create_output_doc(doc)
+            results = self._translate_paragraphs(paragraphs, source_lang)
+            
+            self._write_results(output_doc, results)
+            output_doc.save(f"{os.path.splitext(file_path)[0]}_翻译结果.docx")
+            
+        total_time = time.time() - start_time
+        print(f"\n{'='*50}\n完成！总耗时: {total_time:.2f}秒\n{'='*50}")
+
+    def _find_docx_files(self):
+        """查找有效Word文档"""
+        return [os.path.join(self.folder_path, f) 
+                for f in os.listdir(self.folder_path) 
+                if f.endswith('.docx') and not f.startswith('~$')]
+    
+    def _open_docx(self, file_path):
+        """打开Word文档"""
+        try:
+            return Document(file_path)
+        except Exception as e:
+            print(f"打开文件失败: {str(e)}")
+            return None
+    
+    def _extract_paragraphs(self, doc):
+        """提取可翻译段落"""
+        return [para.text.strip() for para in doc.paragraphs if para.text.strip()]
+    
+    def _create_output_doc(self, doc):
+        """创建输出文档"""
+        new_doc = Document()
+        new_doc.styles['Normal'].font.name = 'Calibri'
+        new_doc.styles['Normal']._element.rPr.rFonts.set(qn('w:eastAsia'), 'Calibri')
+        return new_doc
+    
+    def _translate_paragraphs(self, paragraphs, source_lang):
+        """多线程翻译段落"""
+        results = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(self.translator.translate_text, 
+                                      text=p, 
+                                      source_lang=self.LANG_MAP[source_lang], 
+                                      target_lang='zh', 
+                                      project_id=""): i for i, p in enumerate(paragraphs)}
+            
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    results.append({"error": f"段落 {idx+1} 翻译失败: {str(e)}"})
+        return results
+    
+    def _write_results(self, doc, results):
+        """写入翻译结果"""
+        for item in results:
+            if "error" in item:
+                p = doc.add_paragraph(item["error"], style='IntenseQuote')
+                p.bold = True
+            else:
+                run = doc.add_paragraph(item["translated_text"]).add_run()
+                run.font.highlight_color = 2  # 黄色高亮
+                run.add_text("（已翻译）")
+
+if __name__ == "__main__":
+    print("=== 腾讯混元翻译工具 ===")
+    
+    folder_path = input("请输入文档目录路径：").strip()
+    while not os.path.isdir(folder_path):
+        folder_path = input("无效路径，请重新输入：").strip()
+    
+    source_lang = input("请输入源语言代码（如en）：").strip().lower()
+    while source_lang not in DocumentProcessor.LANG_MAP:
+        source_lang = input("无效语言代码，请重新输入：").strip().lower()
+    
+    processor = DocumentProcessor(folder_path)
+    processor.process_folder(source_lang)
