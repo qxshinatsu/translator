@@ -1,0 +1,220 @@
+#1.运行程序后输入文件夹名和对应语言的字母
+#2.需要安装python-docx、tencentcloud-sdk-python-hunyuan，命令如下
+##pip install python-docx -i https://pypi.tuna.tsinghua.edu.cn/simple
+##pip install tencentcloud-sdk-python-hunyuan -i https://pypi.tuna.tsinghua.edu.cn/simple
+#3.模型可以更换，详见req.Model
+import os
+import re
+import time
+from typing import List, Dict
+from docx import Document
+from docx.oxml.ns import qn
+from docx.shared import Pt, RGBColor
+from tencentcloud.common import credential, exception
+from tencentcloud.common.profile.client_profile import ClientProfile
+from tencentcloud.common.profile.http_profile import HttpProfile
+from tencentcloud.hunyuan.v20230901 import hunyuan_client, models
+
+class OpenAIStyleTranslator:
+    """兼容OpenAI接口格式的腾讯混元封装类"""
+    
+    def __init__(self):
+        self.client = self._init_client()
+        self.model = "Tencent-Hunyuan" #Hunyuan-T1-20250403 Tencent-Hunyuan
+        
+    def _init_client(self):
+        """初始化腾讯云客户端"""
+        secret_id = os.getenv("TENCENT_SECRET_ID")
+        secret_key = os.getenv("TENCENT_SECRET_KEY")
+        
+        if not secret_id or not secret_key:
+            raise ValueError("缺少腾讯云凭证，请设置环境变量TENCENT_SECRET_ID和TENCENT_SECRET_KEY")
+
+        cred = credential.Credential(secret_id, secret_key)
+        http_profile = HttpProfile()
+        http_profile.endpoint = "hunyuan.tencentcloudapi.com"
+        http_profile.reqTimeout = 30
+
+        client_profile = ClientProfile()
+        client_profile.httpProfile = http_profile
+
+        return hunyuan_client.HunyuanClient(cred, "ap-guangzhou", client_profile)
+
+    def create_translation(self, messages: List[Dict], **kwargs) -> Dict:
+        """
+        兼容OpenAI格式的翻译接口
+        :param messages: 消息列表，要求包含源文本和语言信息
+        :return: OpenAI风格响应格式
+        """
+        required_params = ["source_lang", "target_lang"]
+        for param in required_params:
+            if param not in kwargs:
+                raise ValueError(f"缺少必要参数: {param}")
+
+        prompt = self._build_prompt(messages, **kwargs)
+        
+        try:
+            req = models.ChatCompletionsRequest()
+            req.Messages = [{"Role": "user", "Content": prompt}]
+            req.Stream = False
+            req.Temperature = 0.1
+            req.Model = "hunyuan-a13b"  #可以更换模型，模型地址https://cloud.tencent.com/document/product/1729/104753
+            
+            start_time = time.time()
+            resp = self.client.ChatCompletions(req)
+            latency = time.time() - start_time
+            
+            return {
+                "model": self.model,
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": resp.Choices[0].Message.Content.strip()
+                    }
+                }],
+                "usage": {
+                    "total_tokens": resp.Usage.TotalTokens,
+                    "prompt_tokens": resp.Usage.PromptTokens,
+                    "completion_tokens": resp.Usage.CompletionTokens
+                },
+                "latency": latency
+            }
+        except exception.TencentCloudSDKException as e:
+            return {"error": f"API调用失败: {str(e)}"}
+        except Exception as e:
+            return {"error": f"未知错误: {str(e)}"}
+
+    def _build_prompt(self, messages: List[Dict], **kwargs) -> str:
+        """构造翻译提示词"""
+        source_lang = kwargs["source_lang"]
+        target_lang = kwargs["target_lang"]
+        text = messages[-1]["content"]  # 获取最后一条用户消息内容
+        
+        return (
+            f"你是一名专业翻译，请将以下{source_lang}内容准确翻译成{target_lang}。\n"
+            "翻译要求：\n"
+            "1. 保持专业术语准确\n"
+            "2. 保留特殊符号，不翻译\n"
+            "3. 不要添加任何解释\n"
+            "4. 只输出翻译结果，其他信息不要输出\n"
+            "5. 保持段落结构一致\n\n"
+            f"待翻译内容：\n{text}"
+        )
+
+class DocumentProcessor:
+    """文档处理核心类"""
+    
+    LANG_MAP = {
+        "de": "德文", "fr": "法文", "en": "英文",
+        "ja": "日文", "da": "丹麦文", "zh": "中文","it": "意大利文","nor":"挪威文"
+    }
+
+    def __init__(self):
+        self.translator = OpenAIStyleTranslator()
+
+    def _create_document(self) -> Document:
+        """创建标准化输出文档"""
+        doc = Document()
+        style = doc.styles["Normal"]
+        font = style.font
+        font.name = "微软雅黑"
+        font.size = Pt(10.5)
+        font.element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+        font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        return doc
+
+    def process_folder(self, folder_path: str, source_lang: str):
+        """处理整个文件夹"""
+        valid_files = self._find_docx_files(folder_path)
+        
+        if not valid_files:
+            print("未找到有效的Word文档")
+            return
+
+        for file_path in valid_files:
+            self._process_single_file(file_path, source_lang)
+
+    def _find_docx_files(self, folder_path: str) -> List[str]:
+        """查找有效Word文档"""
+        valid_files = []
+        for filename in os.listdir(folder_path):
+            if filename.lower().endswith(".docx") and not filename.startswith("~$"):
+                valid_files.append(os.path.join(folder_path, filename))
+        return valid_files
+
+    def _process_single_file(self, file_path: str, source_lang: str):
+        """处理单个文件并保存独立翻译结果"""
+        print(f"\n正在处理文件：{os.path.basename(file_path)}")
+        output_doc = self._create_document()
+        
+        try:
+            doc = Document(file_path)
+            total_paragraphs = len(doc.paragraphs)
+            
+            for idx, para in enumerate(doc.paragraphs, 1):
+                if not para.text.strip():
+                    continue
+                
+                print(f"进度: {idx}/{total_paragraphs} ({idx/total_paragraphs:.1%})", end='\r')
+                translated = self._translate_paragraph(para.text, source_lang)
+                self._add_translated_paragraph(output_doc, translated)
+                time.sleep(0.5)  # 控制请求频率
+
+            # 保存翻译结果
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            output_path = os.path.join(os.path.dirname(file_path), f"{base_name}_translated.docx")
+            output_doc.save(output_path)
+            print(f"\n已保存翻译文件：{output_path}")
+
+        except Exception as e:
+            print(f"\n文件处理出错：{str(e)}")
+
+    def _translate_paragraph(self, text: str, source_lang: str) -> str:
+        """执行单段落翻译"""
+        messages = [{"role": "user", "content": text}]
+        
+        response = self.translator.create_translation(
+            messages=messages,
+            source_lang=self.LANG_MAP[source_lang],
+            target_lang="中文"
+        )
+
+        if "error" in response:
+            print(f"\n翻译失败：{response['error']}")
+            return f"[翻译失败] {text}"
+        
+        return response["choices"][0]["message"]["content"]
+
+    def _add_translated_paragraph(self, doc: Document, text: str):
+        """添加翻译段落到指定文档"""
+        p = doc.add_paragraph()
+        p.add_run(text).bold = False
+
+def main():
+    """主程序"""
+    print("=== 多语言文档翻译工具 ===")
+    
+    # 获取用户输入
+    folder_path = input("请输入文档目录路径：").strip()
+    while not os.path.isdir(folder_path):
+        print("路径无效，请重新输入")
+        folder_path = input("请输入文档目录路径：").strip()
+
+    print("\n请选择原文语言：")
+    lang_options = "\n".join([f"{code}. {lang}" for code, lang in DocumentProcessor.LANG_MAP.items() if code != "zh"])
+    print(lang_options)
+    
+    source_lang = input("请输入语言代码（如en）：").strip().lower()
+    while source_lang not in DocumentProcessor.LANG_MAP or source_lang == "zh":
+        print("无效的语言代码")
+        source_lang = input("请输入语言代码：").strip().lower()
+
+    # 执行处理
+    try:
+        processor = DocumentProcessor()
+        processor.process_folder(folder_path, source_lang)
+    except Exception as e:
+        print(f"\n程序运行出错：{str(e)}")
+
+if __name__ == "__main__":
+    main()
